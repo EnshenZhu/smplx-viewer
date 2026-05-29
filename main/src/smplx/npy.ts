@@ -95,7 +95,38 @@ export function parseNpy(bytes: Uint8Array): NdArray {
   }
 
   if (fortranOrder && shape.length > 1) {
-    throw new Error('Fortran-ordered arrays are not supported.');
+    // Repack column-major (Fortran) data into row-major (C) layout, which is
+    // what every downstream consumer assumes. We walk the output in C order,
+    // decode each multi-index, and read the matching Fortran source element.
+    const n = shape.length;
+    const cStrides = new Array<number>(n); // row-major strides
+    const fStrides = new Array<number>(n); // column-major strides
+    let cAcc = 1;
+    for (let k = n - 1; k >= 0; k--) {
+      cStrides[k] = cAcc;
+      cAcc *= shape[k];
+    }
+    let fAcc = 1;
+    for (let k = 0; k < n; k++) {
+      fStrides[k] = fAcc;
+      fAcc *= shape[k];
+    }
+    const reordered = new (data.constructor as {
+      new (len: number): typeof data;
+    })(count);
+    for (let c = 0; c < count; c++) {
+      let rem = c;
+      let f = 0;
+      for (let k = 0; k < n; k++) {
+        const idx = (rem / cStrides[k]) | 0;
+        rem -= idx * cStrides[k];
+        f += idx * fStrides[k];
+      }
+      reordered[c] = data[f];
+    }
+    data = reordered;
+    // Data is now C-contiguous; reflect that in the returned flag.
+    return { dtype, shape, fortranOrder: false, data };
   }
 
   return { dtype, shape, fortranOrder, data };
@@ -108,10 +139,23 @@ export function parseNpz(bytes: Uint8Array): Promise<Record<string, NdArray>> {
       if (err) return reject(err);
       try {
         const out: Record<string, NdArray> = {};
+        const skipped: string[] = [];
         for (const name of Object.keys(files)) {
           if (!name.endsWith('.npy')) continue;
           const key = name.replace(/\.npy$/, '');
-          out[key] = parseNpy(files[name]);
+          try {
+            out[key] = parseNpy(files[name]);
+          } catch (e) {
+            // Some SMPL-X archives include pickled Python objects (e.g. the
+            // part2num / joint2num lookup dicts use dtype '|O'). The mesh does
+            // not need them, so skip anything we can't parse and keep going.
+            // Missing *required* arrays are reported later, by the model loader.
+            skipped.push(`${key} (${(e as Error).message})`);
+          }
+        }
+        if (skipped.length) {
+          // eslint-disable-next-line no-console
+          console.info('[smplx] skipped unparseable npz entries:', skipped.join(', '));
         }
         resolve(out);
       } catch (e) {
